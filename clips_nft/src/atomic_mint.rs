@@ -17,6 +17,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, St
 
 use crate::blacklist;
 use crate::clip_id_storage;
+use crate::creator_event;
 use crate::creator_portfolio;
 use crate::creator_storage;
 use crate::mint_authorization;
@@ -205,6 +206,17 @@ pub fn execute_atomic_mint(env: &Env, params: &MintParams) -> Result<TokenId, Er
         params.creator_display_name.clone(),
     );
     rollback.wrote_creator_metadata = true;
+
+    // Emit creator-assigned event (issue #920).
+    // Emitted after creator metadata is durably written so subscribers can
+    // query the creator record immediately.
+    creator_event::emit_creator_assigned(
+        env,
+        token_id,
+        &creator_addr,
+        params.clip_id,
+        env.ledger().timestamp(),
+    );
 
     // Add to creator portfolio (non-fatal on duplicate, shouldn't happen for new token)
     let _ = creator_portfolio::add_token_to_creator(env, &creator_addr, token_id);

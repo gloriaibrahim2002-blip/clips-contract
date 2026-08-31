@@ -6,7 +6,7 @@
 
 #![cfg(test)]
 
-use clips_nft::{execute_mint, types::CreatorAssignedEvent, MintRequest, Royalty};
+use clips_nft::{execute_mint, types::CreatorAssignedEvent, MintRequest, Royalty, RoyaltyRecipient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo},
     Address, Env, String, Val, Vec,
@@ -28,8 +28,13 @@ fn make_request(
         thumbnail_uri: None,
         preview_video_uri: None,
         royalty_info: Royalty {
-            recipient: Address::generate(env),
-            basis_points: 500,
+            recipients: soroban_sdk::vec![
+                env,
+                RoyaltyRecipient {
+                    recipient: Address::generate(env),
+                    basis_points: 500,
+                }
+            ],
             asset_address: None,
         },
         creator_address: creator.map(|c| c.clone()),

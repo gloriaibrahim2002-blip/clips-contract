@@ -7,7 +7,7 @@
 
 extern crate alloc;
 
-use soroban_sdk::{contract, contractimpl, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, token, Address, Env, String};
 
 /// Maximum allowable listing/offer price. Mirrors the bound enforced by the
 /// marketplace listing validator (#865).
@@ -70,11 +70,12 @@ impl ClipCashNFT {
 // ─── Core types ───────────────────────────────────────────────────────────────
 pub mod types;
 pub use types::{
-    BatchId, BatchMintResponse, BurnEvent, DataKey, Error, Listing, ListingId, ListingStatus,
-    MetadataUpdatedEvent, MintEvent, MintSuccessResponse, NFTMintedEvent, Royalty, RoyaltyFrozenEvent,
-    RoyaltyInfo, RoyaltyPaidEvent, RoyaltyPayment, RoyaltyPaymentsDisabledEvent, RoyaltyPaymentResult,
-    RoyaltyRecipient, RoyaltyUpdatedEvent, TokenData, TokenId, TransactionStatus, TransferEvent,
-    TransferResult,
+    ApprovalRevokedEvent, ApprovalScope, BatchId, BatchMintResponse, BurnEvent, ConfigField,
+    ConfigUpdatedEvent, ConfigValue, ContractPausedEvent, ContractUnpausedEvent, DataKey, Error,
+    Listing, ListingId, ListingStatus, MetadataUpdatedEvent, MintEvent, MintSuccessResponse,
+    NFTMintedEvent, NFTUnfrozenEvent, Royalty, RoyaltyFrozenEvent, RoyaltyInfo, RoyaltyPaidEvent,
+    RoyaltyPayment, RoyaltyPaymentResult, RoyaltyPaymentsDisabledEvent, RoyaltyRecipient,
+    RoyaltyUpdatedEvent, TokenData, TokenId, TransactionStatus, TransferEvent, TransferResult,
 };
 pub mod contract_version;
 pub mod default_royalty;
@@ -99,9 +100,12 @@ pub mod listing_storage;
 pub mod listing_id_generator;
 
 pub mod batch_mint_event;
+pub mod approval_granted_event;
 pub mod creator_event;
 pub mod listing_cancelled_event;
 pub mod mint_event;
+pub mod nft_frozen_event;
+pub mod nft_unfrozen_event;
 pub mod nft_listed_event;
 pub mod nft_sold_event;
 pub mod offer_accepted_event;
@@ -170,6 +174,11 @@ pub mod royalty_earnings;
 pub mod royalty_payment;
 pub mod royalty_payment_replay;
 pub mod royalty_recipient_validator;
+
+// ─── Administrative / lifecycle events (issues #931–#934) ────────────────────
+pub mod approval_revoked_event;
+pub mod config_updated_event;
+pub mod pause_event;
 
 // ─── Guard / safety ───────────────────────────────────────────────────────────
 pub mod blacklist;
@@ -345,6 +354,115 @@ impl ClipsNftContract {
         default_royalty::get_default_royalty_bps(&env)
     }
 
+    // ── Pause lifecycle (issues #933, #934) ──────────────────────────────────
+
+    /// Pause the contract, blocking every entry point guarded by
+    /// [`pause_guard::require_not_paused`] (issue #933).
+    ///
+    /// Emits a `"ctr_pause"` [`ContractPausedEvent`] carrying the administrator,
+    /// the ledger timestamp, and an optional free-text `reason`.
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialized`] if the contract has not been initialized.
+    /// - [`Error::UnauthorizedConfigurationUpdate`] if `admin` is not the
+    ///   contract administrator.
+    /// - [`Error::ContractPaused`] if the contract is already paused, so a
+    ///   received event always marks a real state change.
+    pub fn pause(
+        env: Env,
+        admin: Address,
+        reason: Option<soroban_sdk::String>,
+    ) -> Result<(), Error> {
+        config_guard::require_config_admin(&env, &admin)?;
+        if pause_state::get_pause_state(&env) {
+            return Err(Error::ContractPaused);
+        }
+        pause_state::save_pause_state(&env, true);
+        pause_event::emit_contract_paused(&env, &admin, reason, env.ledger().timestamp());
+        Ok(())
+    }
+
+    /// Resume a paused contract (issue #934).
+    ///
+    /// Emits a `"ctr_unpse"` [`ContractUnpausedEvent`] carrying the
+    /// administrator and the ledger timestamp.
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialized`] if the contract has not been initialized.
+    /// - [`Error::UnauthorizedConfigurationUpdate`] if `admin` is not the
+    ///   contract administrator.
+    /// - [`Error::NotPaused`] if the contract is not currently paused.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), Error> {
+        config_guard::require_config_admin(&env, &admin)?;
+        if !pause_state::get_pause_state(&env) {
+            return Err(Error::NotPaused);
+        }
+        pause_state::save_pause_state(&env, false);
+        pause_event::emit_contract_unpaused(&env, &admin, env.ledger().timestamp());
+        Ok(())
+    }
+
+    /// Return `true` while the contract is paused.
+    pub fn is_paused(env: Env) -> bool {
+        pause_state::get_pause_state(&env)
+    }
+
+    // ── Approval revocation (issue #931) ─────────────────────────────────────
+
+    /// Revoke the single-token approval for `token_id` (issue #931).
+    ///
+    /// Emits an `"aprv_rvk"` [`ApprovalRevokedEvent`] scoped to the token.
+    /// Returns the address that lost the approval, or `None` when the token had
+    /// no approval — in which case no event is emitted.
+    ///
+    /// Only the token owner may revoke.
+    pub fn revoke_approval(
+        env: Env,
+        owner: Address,
+        token_id: TokenId,
+    ) -> Result<Option<Address>, Error> {
+        owner.require_auth();
+        token_owner_storage::verify_owner(&env, token_id, &owner)?;
+        Ok(token_approval::revoke_approval(&env, &owner, token_id))
+    }
+
+    /// Revoke `operator`'s approval to manage every token owned by `owner`
+    /// (issue #931).
+    ///
+    /// Emits an `"aprv_rvk"` [`ApprovalRevokedEvent`] scoped to
+    /// [`ApprovalScope::AllTokens`]. Returns `true` when an approval was
+    /// actually revoked; a call for an operator that was never approved emits
+    /// nothing.
+    pub fn revoke_operator_approval(env: Env, owner: Address, operator: Address) -> bool {
+        owner.require_auth();
+        operator_approval::revoke_operator(&env, &owner, &operator)
+    }
+
+    // ── Supported payment assets (issue #932) ────────────────────────────────
+
+    /// Register a supported payment currency (issue #932).
+    ///
+    /// Emits a `"cfg_updt"` [`ConfigUpdatedEvent`] for
+    /// [`ConfigField::SupportedAsset`] on success.
+    pub fn add_currency(env: Env, admin: Address, currency: Address) -> Result<(), Error> {
+        config_guard::require_config_admin(&env, &admin)?;
+        payment_currency::add_currency_by(&env, &admin, currency)
+    }
+
+    /// Deregister a supported payment currency (issue #932).
+    ///
+    /// Emits a `"cfg_updt"` [`ConfigUpdatedEvent`] for
+    /// [`ConfigField::SupportedAsset`] on success.
+    pub fn remove_currency(env: Env, admin: Address, currency: Address) -> Result<(), Error> {
+        config_guard::require_config_admin(&env, &admin)?;
+        payment_currency::remove_currency_by(&env, &admin, &currency)
+    }
+
+    /// Return every currently supported payment currency.
+    pub fn get_currencies(env: Env) -> soroban_sdk::Vec<Address> {
+        payment_currency::get_currencies(&env)
+    }
+
     /// Process a royalty payment for a secondary sale (issues #809, #810, #831, #832, #833, #837).
     ///
     /// Computes the royalty amount from `sale_price` using the token's configured
@@ -419,12 +537,68 @@ impl ClipsNftContract {
         token_storage::get_royalty(&env, token_id)
     }
 
+    /// Freeze a token and emit an audit event.
+    pub fn freeze_token(
+        env: Env,
+        caller: Address,
+        token_id: TokenId,
+        reason: Option<String>,
+    ) -> Result<(), Error> {
+        config_guard::require_config_admin(&env, &caller)?;
+        if frozen_token::freeze_token(&env, token_id) {
+            nft_frozen_event::emit_nft_frozen(
+                &env,
+                token_id,
+                &caller,
+                reason.as_ref(),
+                env.ledger().timestamp(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Remove the frozen state from a token and emit an audit event.
+    pub fn unfreeze_token(
+        env: Env,
+        caller: Address,
+        token_id: TokenId,
+    ) -> Result<(), Error> {
+        config_guard::require_config_admin(&env, &caller)?;
+        if frozen_token::unfreeze_token(&env, token_id) {
+            nft_unfrozen_event::emit_nft_unfrozen(
+                &env,
+                token_id,
+                &caller,
+                env.ledger().timestamp(),
+            );
+        }
+        Ok(())
+    }
+
     // ── Marketplace listing lifecycle (issues #871, #883, #884) ──────────────
 
+    /// List an NFT for sale in the marketplace.
+    ///
+    /// Validates all pre-conditions, generates a unique listing ID, persists the
+    /// listing, and emits an `NftListedEvent` for off-chain indexers.
+    ///
+    /// # Acceptance Criteria
+    /// 1. Validate listing (price, payment asset, expiration, no duplicate active listing)
+    /// 2. Verify ownership (caller must own the NFT)
+    /// 3. Generate listing ID (monotonic counter)
+    /// 4. Store listing (persistent storage)
+    /// 5. Emit listing event (NftListedEvent)
+    /// 6. Return listing ID
+    pub fn list_nft(env: Env, request: ListingRequest) -> Result<ListingId, Error> {
+        request.seller.require_auth();
+        marketplace::list_nft(&env, &request)
+    }
+
     pub fn create_listing(env: Env, listing: ListingRequest) -> Result<ListingId, Error> {
+        let mut listing = listing;
         listing.seller.require_auth();
         token_owner_storage::verify_owner(&env, listing.token_id, &listing.seller)?;
-        let listing_id = listing_storage::create_listing(&env, &listing)?;
+        let listing_id = listing_storage::create_listing(&env, &mut listing)?;
         events::listing::emit_listing_created(
             &env,
             listing.token_id,
@@ -456,14 +630,6 @@ impl ClipsNftContract {
             env.ledger().timestamp(),
         );
         Ok(())
-        listing_cancelled_event::emit_listing_cancelled(
-            &env,
-            listing.listing_id,
-            token_id,
-            &listing.seller,
-            env.ledger().timestamp(),
-        );
-        listing_storage::remove_listing(&env, token_id)
     }
 
     /// Update the price and/or expiration of an active listing (issue #871).
@@ -498,6 +664,7 @@ impl ClipsNftContract {
 
         let old_price = listing.price;
         let old_expiration = listing.expiration;
+        let listing_id = listing.listing_id;
         let mut updated = listing;
         updated.price = new_price;
         updated.expiration = new_expiration;
@@ -505,6 +672,7 @@ impl ClipsNftContract {
 
         events::listing::emit_listing_updated(
             &env,
+            listing_id,
             token_id,
             &seller,
             old_price,
@@ -551,7 +719,11 @@ impl ClipsNftContract {
 
         let token_client = token::Client::new(&env, &payment_asset);
         if result.platform_fee > 0 {
-            token_client.transfer(&buyer, &env.current_contract_address(), &result.platform_fee);
+            token_client.transfer(
+                &buyer,
+                &env.current_contract_address(),
+                &result.platform_fee,
+            );
         }
         let seller_net = amount
             .checked_sub(result.total_royalty)
@@ -649,7 +821,11 @@ impl ClipsNftContract {
 
         let token_client = token::Client::new(&env, &offer.payment_asset);
         if result.platform_fee > 0 {
-            token_client.transfer(&offer.buyer, &env.current_contract_address(), &result.platform_fee);
+            token_client.transfer(
+                &offer.buyer,
+                &env.current_contract_address(),
+                &result.platform_fee,
+            );
         }
         let seller_net = offer
             .price
